@@ -549,9 +549,19 @@ async function loadPublished() {
   }
   empty.classList.add("hidden");
   content.classList.remove("hidden");
-  const when = new Date(data.created_at).toLocaleString("zh-CN");
+  // 已发布地址表来自发布时的不可变快照：发布后改名、切换锁定、调整保留区
+  // 都不会改变此表与 CSV；仅旧库缺少快照的记录回退为按当前配置重建并提示。
+  const when = new Date(data.published_at || data.created_at).toLocaleString("zh-CN");
   $("#published-meta").textContent =
     `发布 #${data.plan_id} · 配置 v${data.config_version} · ${when} · 迁移 ${data.migration_count} 台 · 启用 ${data.used_lines} 条线路`;
+  const notice = $("#published-notice");
+  if (data.from_snapshot === false) {
+    notice.textContent =
+      data.notice || "该发布记录缺少快照，以下内容按当前配置重建，可能与发布时不一致。";
+    notice.classList.remove("hidden");
+  } else {
+    notice.classList.add("hidden");
+  }
   $("#btn-download-csv").href = `/api/plans/published/${data.plan_id}/csv`;
   $("#published-tbody").innerHTML = data.allocations
     .map(

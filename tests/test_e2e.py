@@ -665,3 +665,156 @@ def test_27_preview_recovers_after_empty_candidate(client):
     r = client.post(f"/api/plans/{p['plan_id']}/publish")
     assert r.status_code == 200, r.text
     assert r.json()["ok"] is True
+
+
+def test_28_published_view_restored_from_snapshot(client):
+    """发布后改名/切锁定/加保留区/线路重命名，已发布查询与 CSV 仍以快照为准。"""
+    modes = client.get("/api/catalog").json()
+    mode3 = next(m for t in modes if t["name"] == "Par" for m in t["modes"])
+    # 既有地址放在空闲的线路 3，迁移 0 约束下必然留在原位（确定性）
+    r = client.post("/api/fixtures", json={"name": "Drift", "mode_id": mode3["id"],
+                                           "previous_line": 3, "previous_start": 400})
+    assert r.status_code == 201
+    drift_id = r.json()["id"]
+
+    p = client.post("/api/plans/preview").json()
+    assert p["optimality_status"] == "optimal"
+    plan_id, cv = p["plan_id"], p["config_version"]
+    drift_alloc = next(a for a in p["allocations"] if a["name"] == "Drift")
+    assert (drift_alloc["line_id"], drift_alloc["start"]) == (3, 400)
+
+    r = client.post(f"/api/plans/{plan_id}/publish")
+    assert r.status_code == 200, r.text
+
+    # 发布后的漂移源：改名、切换锁定、新增保留区、线路重命名
+    assert client.put(f"/api/fixtures/{drift_id}", json={"name": "DriftX"}).status_code == 200
+    assert client.put(f"/api/fixtures/{drift_id}", json={"locked": True}).status_code == 200
+    assert client.post("/api/reservations",
+                       json={"line_id": 1, "start": 450, "end": 460, "reason": "new"}).status_code == 201
+    assert client.patch("/api/lines/1", json={"name": "Universe-A"}).status_code == 200
+
+    # 已发布查询：地址/名称/锁定/占用从快照还原，状态与原配置版本以方案记录为准
+    got = client.get(f"/api/plans/{plan_id}").json()
+    assert got["status"] == "published"  # 不得返回快照里发布前的 draft
+    assert got["from_snapshot"] is True
+    assert got["config_version"] == cv
+    assert got["published_at"]
+    by_id = {a["fixture_id"]: a for a in got["allocations"]}
+    assert by_id[drift_id]["name"] == "Drift"  # 不随改名漂移
+    assert by_id[drift_id]["locked"] is False  # 不随锁定切换漂移
+    assert (by_id[drift_id]["line_id"], by_id[drift_id]["start"]) == (3, 400)
+    line1 = next(l for l in got["occupancy"] if l["line_id"] == 1)
+    assert line1["name"] == "线路 1"  # 不随线路重命名漂移
+    assert line1["reservations"] == []  # 不随新增保留区漂移
+
+    # published/latest 同样走快照
+    latest = client.get("/api/plans/published/latest").json()
+    assert latest["has_published"] is True
+    assert latest["plan_id"] == plan_id
+    assert latest["status"] == "published"
+    latest_names = {a["name"] for a in latest["allocations"]}
+    assert "Drift" in latest_names and "DriftX" not in latest_names
+
+    # CSV 与页面同源：旧名在、新名不在
+    csv_resp = client.get(f"/api/plans/published/{plan_id}/csv")
+    assert csv_resp.status_code == 200
+    text = csv_resp.content.decode("utf-8-sig")
+    assert "Drift" in text and "DriftX" not in text
+
+
+def test_29_migrations_survive_publish(client):
+    """迁移清单在发布后不从已发布查询/CSV 中消失（回归：发布后立即变空）。"""
+    modes = client.get("/api/catalog").json()
+    mode20 = next(m for t in modes for m in t["modes"] if m["channels"] == 20)
+    r = client.post("/api/fixtures", json={"name": "Mig", "mode_id": mode20["id"],
+                                           "previous_line": 3, "previous_start": 100})
+    assert r.status_code == 201
+    # 保留区覆盖其既有位置，迫使它迁移
+    assert client.post("/api/reservations",
+                       json={"line_id": 3, "start": 90, "end": 130, "reason": "force-move"}).status_code == 201
+
+    p = client.post("/api/plans/preview").json()
+    assert p["optimality_status"] == "optimal"
+    plan_id = p["plan_id"]
+    mig_moves = [m for m in p["migrations"] if m["name"] == "Mig"]
+    assert len(mig_moves) == 1
+    assert (mig_moves[0]["from_line"], mig_moves[0]["from_start"]) == (3, 100)
+    assert p["migration_count"] >= 1
+
+    assert client.post(f"/api/plans/{plan_id}/publish").status_code == 200
+
+    # 既有地址已回写；若按当前状态重建迁移清单会变空，快照还原则保持发布时内容
+    got = client.get(f"/api/plans/{plan_id}").json()
+    assert got["from_snapshot"] is True
+    assert got["migrations"] == p["migrations"]
+    assert got["migration_count"] == p["migration_count"]
+
+    latest = client.get("/api/plans/published/latest").json()
+    assert [m for m in latest["migrations"] if m["name"] == "Mig"]
+
+    csv_text = client.get(f"/api/plans/published/{plan_id}/csv").content.decode("utf-8-sig")
+    mig_row = next(row for row in csv_text.splitlines() if row.split(",")[1] == "Mig")
+    assert mig_row.split(",")[6] == "是"  # 是否迁移列
+
+
+def test_30_legacy_published_without_snapshot_falls_back(client):
+    """旧库缺少快照的发布记录：查询与 CSV 回退重建，并明确标注非快照事实。"""
+    from datetime import datetime, timezone
+
+    from app.database import SessionLocal
+    from app.models import Plan, PlanAllocation
+    from app.services import get_config_version
+
+    with SessionLocal() as db:
+        plan = Plan(
+            config_version=get_config_version(db),
+            status="published",
+            optimality_status="optimal",
+            migration_count=0,
+            used_lines=1,
+            # 老记录时间戳，避免抢占 published/latest
+            published_at=datetime(2020, 1, 1, tzinfo=timezone.utc),
+        )
+        db.add(plan)
+        db.flush()
+        db.add(
+            PlanAllocation(plan_id=plan.id, fixture_id=1, line_id=1, start=1, end=3, migrated=False)
+        )
+        db.commit()
+        legacy_id = plan.id
+
+    got = client.get(f"/api/plans/{legacy_id}").json()
+    assert got["status"] == "published"
+    assert got["from_snapshot"] is False
+    assert got["notice"]  # 无法还原的发布时字段不得伪装成历史事实
+    assert got["allocations"]
+
+    csv_resp = client.get(f"/api/plans/published/{legacy_id}/csv")
+    assert csv_resp.status_code == 200
+    assert csv_resp.content.startswith(b"\xef\xbb\xbf")
+
+    # latest 仍是真正最近发布的方案
+    latest = client.get("/api/plans/published/latest").json()
+    assert latest["plan_id"] != legacy_id
+
+
+def test_31_draft_query_uses_live_state(client):
+    """草稿仍按当前预览路径重建：改名即时反映；配置变化后过期草稿拒发。"""
+    p = client.post("/api/plans/preview").json()
+    assert p["optimality_status"] == "optimal"
+    plan_id = p["plan_id"]
+
+    fx = {f["name"]: f for f in client.get("/api/fixtures").json()}
+    par1_id = fx["Par1"]["id"]
+    assert client.put(f"/api/fixtures/{par1_id}", json={"name": "Par1Renamed"}).status_code == 200
+    try:
+        got = client.get(f"/api/plans/{plan_id}").json()
+        assert got["status"] == "draft"
+        assert got["from_snapshot"] is False
+        assert "Par1Renamed" in {a["name"] for a in got["allocations"]}
+
+        # 配置已变化，过期草稿拒发
+        r = client.post(f"/api/plans/{plan_id}/publish")
+        assert r.status_code == 409
+    finally:
+        client.put(f"/api/fixtures/{par1_id}", json={"name": "Par1"})

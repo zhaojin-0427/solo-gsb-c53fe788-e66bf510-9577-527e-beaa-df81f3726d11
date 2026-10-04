@@ -3,15 +3,14 @@ from __future__ import annotations
 
 import csv
 import io
-import json
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
 
 from .. import planner
 from ..database import get_db
-from ..models import Plan, PublishedSnapshot
+from ..models import Plan
 from ..services import get_config_version
 
 router = APIRouter(prefix="/api/plans", tags=["plans"])
@@ -54,21 +53,12 @@ def latest(db: Session = Depends(get_db)):
 
 @router.get("/published/{plan_id}/csv")
 def published_csv(plan_id: int, db: Session = Depends(get_db)):
-    snap = (
-        db.query(PublishedSnapshot)
-        .filter(PublishedSnapshot.plan_id == plan_id)
-        .order_by(PublishedSnapshot.id.desc())
-        .first()
-    )
-    if snap is None:
-        plan = db.get(Plan, plan_id)
-        if plan is None or plan.status != "published":
-            from fastapi import HTTPException
-
-            raise HTTPException(status_code=404, detail="该方案尚未发布")
-        payload = planner.get_plan_payload(db, plan_id)
-    else:
-        payload = json.loads(snap.payload)
+    plan = db.get(Plan, plan_id)
+    if plan is None or plan.status != "published":
+        raise HTTPException(status_code=404, detail="该方案尚未发布")
+    # 与已发布查询同一路径：优先从快照还原，旧库无快照时回退重建，
+    # 保证页面地址表与 CSV 内容一致
+    payload = planner.get_plan_payload(db, plan_id)
 
     buf = io.StringIO()
     buf.write("﻿")

@@ -181,6 +181,9 @@ def _plan_payload(db: Session, plan: Plan, *, feasible: bool = True) -> dict:
         "migration_count": plan.migration_count,
         "used_lines": plan.used_lines,
         "created_at": plan.created_at,
+        "published_at": plan.published_at,
+        # 本函数始终按当前灯具/线路/保留区实时重建，不是发布快照
+        "from_snapshot": False,
         "allocations": alloc_out,
         "migrations": _migrations_from_alloc(db, alloc_out),
         "occupancy": _occupancy_for(db, allocs),
@@ -253,10 +256,68 @@ def _occupancy_for(db: Session, allocs: list[PlanAllocation]) -> list[dict]:
     return out
 
 
+def _latest_snapshot(db: Session, plan_id: int) -> PublishedSnapshot | None:
+    return (
+        db.query(PublishedSnapshot)
+        .filter(PublishedSnapshot.plan_id == plan_id)
+        .order_by(PublishedSnapshot.id.desc())
+        .first()
+    )
+
+
+def _payload_from_snapshot(db: Session, plan: Plan) -> dict | None:
+    """已发布方案：从发布时写入的不可变快照还原地址表。
+
+    地址、名称、锁定、迁移与占用信息一律取自快照（发布时刻的事实），
+    不随后续改名、锁定切换或保留区调整而漂移；状态、原配置版本等以
+    方案记录为准——快照保存于发布事务内，旧快照中的 status 可能仍是
+    发布前的 draft，不能直接返回。旧库缺少快照（或快照损坏）时返回
+    None，由调用方回退。
+    """
+    snap = _latest_snapshot(db, plan.id)
+    if snap is None:
+        return None
+    try:
+        stored = json.loads(snap.payload)
+    except (TypeError, ValueError):
+        return None
+    return {
+        "feasible": bool(stored.get("feasible", True)),
+        "id": plan.id,
+        "plan_id": plan.id,
+        "config_version": plan.config_version,
+        "status": plan.status,
+        "optimality_status": plan.optimality_status,
+        "migration_count": plan.migration_count,
+        "used_lines": plan.used_lines,
+        "created_at": plan.created_at,
+        "published_at": plan.published_at,
+        "from_snapshot": True,
+        "allocations": stored.get("allocations", []),
+        "migrations": stored.get("migrations", []),
+        "occupancy": stored.get("occupancy", []),
+        "conflicts": stored.get("conflicts", []),
+    }
+
+
 def get_plan_payload(db: Session, plan_id: int) -> dict:
     plan = db.get(Plan, plan_id)
     if plan is None:
         raise HTTPException(status_code=404, detail="预览不存在（可能已被新配置覆盖）")
+    if plan.status == "published":
+        restored = _payload_from_snapshot(db, plan)
+        if restored is not None:
+            return restored
+        # 旧库缺少快照的发布记录：回退为按当前灯具/线路/保留区重建。
+        # 名称、锁定、迁移、占用已是当前状态而非发布时事实，必须显式
+        # 标注，不得伪装成历史快照。
+        payload = _plan_payload(db, plan, feasible=True)
+        payload["notice"] = (
+            "该发布记录缺少快照，以下内容按当前灯具、线路与保留区重建，"
+            "名称、锁定、迁移与占用信息可能与发布时不一致。"
+        )
+        return payload
+    # 草稿/已作废：仍按当前预览路径实时重建
     return _plan_payload(db, plan, feasible=True)
 
 
@@ -296,15 +357,17 @@ def publish_plan(db: Session, plan_id: int) -> dict:
             ),
         )
 
-    payload = _plan_payload(db, plan, feasible=True)
     now = datetime.now(timezone.utc)
 
-    # 同一事务内完成：发布本预览、作废其余草稿、回写既有地址、保存快照
+    # 同一事务内完成：发布本预览、作废其余草稿、保存快照、回写既有地址
     db.query(Plan).filter(Plan.status == "draft", Plan.id != plan.id).update(
         {Plan.status: "superseded"}, synchronize_session=False
     )
     plan.status = "published"
     plan.published_at = now
+    # 状态翻转后再构建快照，使快照自身即携带 published 状态与发布时间；
+    # 既有地址回写必须发生在构建之后，否则迁移清单会被回写提前抹平
+    payload = _plan_payload(db, plan, feasible=True)
     db.add(
         PublishedSnapshot(
             plan_id=plan.id,
