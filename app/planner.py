@@ -257,6 +257,9 @@ def get_plan_payload(db: Session, plan_id: int) -> dict:
     plan = db.get(Plan, plan_id)
     if plan is None:
         raise HTTPException(status_code=404, detail="预览不存在（可能已被新配置覆盖）")
+    # 已发布方案必须从发布时快照恢复；草稿/已作废草稿仍按当前配置的预览路径查询。
+    if plan.status == "published":
+        return _published_payload(db, plan)
     return _plan_payload(db, plan, feasible=True)
 
 
@@ -267,6 +270,106 @@ def latest_published(db: Session) -> Plan | None:
         .order_by(Plan.published_at.desc(), Plan.id.desc())
         .first()
     )
+
+
+def get_published_payload(db: Session, plan_id: int) -> dict:
+    plan = db.get(Plan, plan_id)
+    if plan is None:
+        raise HTTPException(status_code=404, detail="预览不存在（可能已被新配置覆盖）")
+    if plan.status != "published":
+        raise HTTPException(status_code=404, detail="该方案尚未发布")
+    return _published_payload(db, plan)
+
+
+# 旧库中早于快照功能上线、无法还原发布时明细时给出的统一说明。
+LEGACY_PUBLISHED_NOTE = (
+    "该发布记录早于快照功能上线，数据库中没有发布时快照：地址与逐台迁移标记取自方案记录，"
+    "灯具名称与锁定状态为查询时的当前值，迁移明细与发布时线路占用已无法还原。"
+)
+
+
+def _published_payload(db: Session, plan: Plan) -> dict:
+    """从发布时快照恢复已发布地址表。
+
+    快照在发布事务内、回写既有地址之前构建，因此名称、锁定、迁移明细与占用都是
+    发布当时的事实；读取时状态与原配置版本仍以方案记录为准——快照构建于状态翻转
+    之前，不能把快照里发布前的 draft 状态直接返回。
+    """
+    snap = (
+        db.query(PublishedSnapshot)
+        .filter(PublishedSnapshot.plan_id == plan.id)
+        .order_by(PublishedSnapshot.id.desc())
+        .first()
+    )
+    if snap is None:
+        return _legacy_published_payload(db, plan)
+
+    payload = json.loads(snap.payload)
+    payload["status"] = "published"
+    payload["config_version"] = plan.config_version
+    payload["published_at"] = plan.published_at
+    payload["snapshot_available"] = True
+    payload.setdefault("migrations_available", True)
+    payload.setdefault("occupancy_available", True)
+    for a in payload.get("allocations", []):
+        # 快照中的名称/锁定即发布时事实；兼容更早版本写入、未带标记的快照。
+        a.setdefault("name_historical", True)
+        a.setdefault("locked_historical", True)
+    return payload
+
+
+def _legacy_published_payload(db: Session, plan: Plan) -> dict:
+    """旧库兼容：没有快照的已发布记录只从方案与分配行尽力恢复。
+
+    PlanAllocation 中的线路/起止地址与逐台 migrated 是真实保留的发布时事实；
+    名称与锁定只能取当前灯具值并显式标记非历史（灯具已删除则名称回退为 #id、
+    锁定未知）；迁移明细（发布前的既有地址）与发布时线路占用没有任何记录可还原，
+    一律置空并给出不可用标记，绝不伪装成历史事实。
+    """
+    allocs = (
+        db.query(PlanAllocation)
+        .filter(PlanAllocation.plan_id == plan.id)
+        .order_by(PlanAllocation.fixture_id)
+        .all()
+    )
+    fixtures = {f.id: f for f in db.query(Fixture).all()}
+    alloc_out: list[dict] = []
+    for a in allocs:
+        fx = fixtures.get(a.fixture_id)
+        alloc_out.append(
+            {
+                "fixture_id": a.fixture_id,
+                "name": fx.name if fx is not None else f"#{a.fixture_id}",
+                "line_id": a.line_id,
+                "start": a.start,
+                "end": a.end,
+                "channels": a.end - a.start + 1,
+                "migrated": a.migrated,  # 发布时逐台迁移事实
+                "locked": fx.locked if fx is not None else None,  # 当前值，非历史
+                "name_historical": False,
+                "locked_historical": False,
+            }
+        )
+    return {
+        "feasible": True,
+        "id": plan.id,
+        "plan_id": plan.id,
+        "config_version": plan.config_version,
+        "status": "published",
+        "optimality_status": plan.optimality_status,
+        "migration_count": plan.migration_count,
+        "used_lines": plan.used_lines,
+        "created_at": plan.created_at,
+        "published_at": plan.published_at,
+        "allocations": alloc_out,
+        "migrations": [],
+        "migrations_available": False,
+        "occupancy": [],
+        "occupancy_available": False,
+        "conflicts": [],
+        "snapshot_available": False,
+        "fallback_note": LEGACY_PUBLISHED_NOTE,
+    }
 
 
 def publish_plan(db: Session, plan_id: int) -> dict:
@@ -296,8 +399,16 @@ def publish_plan(db: Session, plan_id: int) -> dict:
             ),
         )
 
+    # payload 在状态翻转、既有地址回写之前构建：其中的名称、锁定与迁移明细都是
+    # 发布当时的事实，之后的改名、锁定切换或保留区调整都不会再影响已发布表。
     payload = _plan_payload(db, plan, feasible=True)
     now = datetime.now(timezone.utc)
+    payload["snapshot_available"] = True
+    payload["migrations_available"] = True
+    payload["occupancy_available"] = True
+    for a in payload["allocations"]:
+        a["name_historical"] = True
+        a["locked_historical"] = True
 
     # 同一事务内完成：发布本预览、作废其余草稿、回写既有地址、保存快照
     db.query(Plan).filter(Plan.status == "draft", Plan.id != plan.id).update(
@@ -305,6 +416,8 @@ def publish_plan(db: Session, plan_id: int) -> dict:
     )
     plan.status = "published"
     plan.published_at = now
+    # 快照保存发布时的历史内容，但状态与发布时间以方案记录为准（读取时覆盖），
+    # 避免把发布前的 draft 状态当成已发布结果返回。
     db.add(
         PublishedSnapshot(
             plan_id=plan.id,

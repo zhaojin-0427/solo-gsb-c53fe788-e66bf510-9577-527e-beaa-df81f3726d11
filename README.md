@@ -28,6 +28,15 @@
 - **原子发布**：预览绑定配置版本与最优性状态；配置一旦变化旧预览立即失效并拒绝发布（409），
   未证最优或旧版本遗留、**没有最优性证明记录的草稿同样拒发（409）**，需重新生成预览。
   发布在单个数据库事务内完成，并写入不可变快照。
+- **已发布地址表只认发布快照**：`GET /api/plans/{id}`（已发布方案）与
+  `GET /api/plans/published/latest` 都从该次发布的不可变快照恢复地址、名称、锁定、迁移明细
+  与线路占用；**状态与原配置版本以方案记录为准**（快照在状态翻转为 `published` 之前构建，
+  不会把发布前的 `draft` 状态返回）。因此发布后回写既有地址不会让迁移清单变空，之后改名、
+  切换锁定或调整保留区也不会再影响已发布页面与 CSV。草稿仍按当前预览路径实时查询。
+  早于快照功能上线、数据库中没有快照的旧发布记录仍可查询与导出（尽力回退），响应带
+  `snapshot_available=false` 与 `fallback_note`：地址和逐台迁移标记取自方案记录，名称/锁定
+  为查询时当前值，迁移明细与发布时占用置空并标记不可用，**无法还原的字段不会伪装成历史事实**
+  （CSV 中锁定列以“未知”表示并附说明行）。
 - **浏览器防护**：只有 `optimal` 且配置版本未过期的预览可发布；未证最优时显示黄色
   “未证最优（不可发布）”面板——有候选时展示候选排布仅供参考，空候选时提示
   “暂无可展示排布”；两种情况下发布按钮都保持禁用。
@@ -46,6 +55,22 @@ docker compose up --build -d
 > **http://localhost:8000**
 
 数据保存在宿主机 `./data` 目录（绑定挂载到容器内 `/data/dmx.db`）中，容器重建不丢数据。
+
+启动后可在编排台中核对**已发布地址表与 CSV 不受后续配置改动影响**：
+
+1. 浏览器打开 http://localhost:8000 ，导入型录、添加灯具（至少一台有“既有线路/起始地址”，
+   再用一台锁定灯具占住它的原位，以便产生迁移），在 **编排** 页签“生成预览”并“按此预览原子发布”。
+2. 切到 **已发布** 页签：迁移清单仍完整（不会因发布回写既有地址而变空），点击
+   “⬇ 下载已发布地址表 CSV”核对地址、名称、锁定、迁移列。
+3. 回到 **灯具实例** 给灯具改名、切换锁定，再到 **线路与保留区** 增删保留区；重新打开
+   **已发布** 页签与 CSV——内容保持发布时快照不变；页面顶部显示的配置版本为发布时的原版本。
+4. 用接口核对（端口 8000）：
+   ```bash
+   curl -s http://localhost:8000/api/plans/published/latest | python3 -m json.tool
+   curl -sOJ http://localhost:8000/api/plans/published/<plan_id>/csv
+   ```
+   响应中 `status` 恒为 `published`、`config_version` 为发布时原配置版本，`snapshot_available`
+   为 `true`；旧库无快照的发布记录此处为 `false` 并带 `fallback_note`。
 
 停止：
 
@@ -97,8 +122,9 @@ python3 -m uvicorn app.main:app --host 0.0.0.0 --port 8000
 | GET | `/api/plans/version` | 当前配置版本与最近发布信息 |
 | POST | `/api/plans/preview` | 求解并生成预览 |
 | POST | `/api/plans/{id}/publish` | 按预览原子发布（版本不符返回 409） |
-| GET | `/api/plans/published/latest` | 最近一次发布的完整地址表 |
-| GET | `/api/plans/published/{id}/csv` | 下载已发布地址表 CSV |
+| GET | `/api/plans/{id}` | 方案详情：已发布方案从发布快照恢复，草稿按当前预览路径查询 |
+| GET | `/api/plans/published/latest` | 最近一次发布的完整地址表（取自发布时快照） |
+| GET | `/api/plans/published/{id}/csv` | 下载已发布地址表 CSV（与页面同源；旧库无快照时回退并附说明） |
 
 交互式文档：启动后访问 http://localhost:8000/docs 。
 
@@ -229,6 +255,36 @@ curl -s -X POST http://localhost:8000/api/plans/12/publish
 
 `GET /api/plans/{plan_id}` 返回体含 `optimality_status`；`GET /api/plans/published/latest`
 与发布快照同样带该字段，可在查询与发布两侧核对。
+
+已发布查询始终返回发布时快照内容，典型字段：
+
+```json
+{
+  "has_published": true,
+  "id": 12,
+  "plan_id": 12,
+  "status": "published",
+  "optimality_status": "optimal",
+  "config_version": 7,
+  "published_at": "2026-10-02T08:31:05.000000",
+  "snapshot_available": true,
+  "migrations_available": true,
+  "occupancy_available": true,
+  "allocations": [
+    {"fixture_id": 1, "name": "Spot1", "line_id": 1, "start": 10, "end": 19,
+     "channels": 10, "migrated": false, "locked": false,
+     "name_historical": true, "locked_historical": true}
+  ],
+  "migrations": ["...发布当时的迁移明细，不随后续配置变化..."],
+  "occupancy": ["...发布当时的线路、灯具块与保留区..."]
+}
+```
+
+注意 `config_version` 是该方案发布时绑定的**原配置版本**（取自方案记录），不是发布回写
+既有地址后推进的当前版本；`status` 恒为 `published`。旧库无快照的记录会返回
+`"snapshot_available": false`、空的 `migrations`/`occupancy` 及对应 `*_available=false`
+标记与 `fallback_note` 说明，每条 allocation 的 `name_historical`/`locked_historical` 为
+`false`，灯具已删除时 `locked` 为 `null`（CSV 中显示“未知”）。
 
 ## 技术栈
 

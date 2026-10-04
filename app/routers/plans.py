@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import csv
 import io
-import json
 
 from fastapi import APIRouter, Depends
 from fastapi.responses import StreamingResponse
@@ -11,7 +10,6 @@ from sqlalchemy.orm import Session
 
 from .. import planner
 from ..database import get_db
-from ..models import Plan, PublishedSnapshot
 from ..services import get_config_version
 
 router = APIRouter(prefix="/api/plans", tags=["plans"])
@@ -47,34 +45,26 @@ def latest(db: Session = Depends(get_db)):
     plan = planner.latest_published(db)
     if plan is None:
         return {"has_published": False}
-    payload = planner.get_plan_payload(db, plan.id)
+    payload = planner.get_published_payload(db, plan.id)
     payload["has_published"] = True
     return payload
 
 
 @router.get("/published/{plan_id}/csv")
 def published_csv(plan_id: int, db: Session = Depends(get_db)):
-    snap = (
-        db.query(PublishedSnapshot)
-        .filter(PublishedSnapshot.plan_id == plan_id)
-        .order_by(PublishedSnapshot.id.desc())
-        .first()
-    )
-    if snap is None:
-        plan = db.get(Plan, plan_id)
-        if plan is None or plan.status != "published":
-            from fastapi import HTTPException
-
-            raise HTTPException(status_code=404, detail="该方案尚未发布")
-        payload = planner.get_plan_payload(db, plan_id)
-    else:
-        payload = json.loads(snap.payload)
+    # 与已发布查询同一恢复路径：有快照时地址/名称/锁定/迁移均为发布时事实；
+    # 旧库无快照时回退到方案记录，无法还原的字段不伪装成历史。
+    payload = planner.get_published_payload(db, plan_id)
 
     buf = io.StringIO()
     buf.write("﻿")
     writer = csv.writer(buf)
     writer.writerow(["灯具ID", "灯具名称", "线路", "起始地址", "结束地址", "通道数", "是否迁移", "是否锁定"])
     for a in payload["allocations"]:
+        if payload.get("snapshot_available", False):
+            locked_cell = "是" if a["locked"] else "否"
+        else:
+            locked_cell = "是" if a.get("locked") is True else "否" if a.get("locked") is False else "未知"
         writer.writerow(
             [
                 a["fixture_id"],
@@ -84,9 +74,12 @@ def published_csv(plan_id: int, db: Session = Depends(get_db)):
                 a["end"],
                 a["channels"],
                 "是" if a["migrated"] else "否",
-                "是" if a["locked"] else "否",
+                locked_cell,
             ]
         )
+    if not payload.get("snapshot_available", False) and payload.get("fallback_note"):
+        writer.writerow([])
+        writer.writerow([payload["fallback_note"]])
     buf.seek(0)
     filename = f"dmx_addresses_plan{plan_id}_v{payload['config_version']}.csv"
     return StreamingResponse(

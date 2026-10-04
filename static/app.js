@@ -549,18 +549,34 @@ async function loadPublished() {
   }
   empty.classList.add("hidden");
   content.classList.remove("hidden");
-  const when = new Date(data.created_at).toLocaleString("zh-CN");
+  const when = new Date(data.published_at ?? data.created_at).toLocaleString("zh-CN");
   $("#published-meta").textContent =
     `发布 #${data.plan_id} · 配置 v${data.config_version} · ${when} · 迁移 ${data.migration_count} 台 · 启用 ${data.used_lines} 条线路`;
   $("#btn-download-csv").href = `/api/plans/published/${data.plan_id}/csv`;
+
+  // 旧库无快照的发布记录：迁移明细/占用无法还原，名称与锁定也可能不是发布时值。
+  const fallback = $("#published-fallback");
+  if (data.snapshot_available === false) {
+    fallback.textContent = `⚠️ ${data.fallback_note || "该发布记录没有发布时快照，以下内容为尽力恢复结果。"}`;
+    fallback.classList.remove("hidden");
+  } else {
+    fallback.classList.add("hidden");
+  }
+
   $("#published-tbody").innerHTML = data.allocations
     .map(
-      (a) => `
+      (a) => {
+        const lockedCell = a.locked === true ? "🔒" : a.locked === false ? "" : "未知";
+        const nameCell = a.name_historical === false
+          ? `${esc(a.name)} <span class="muted" title="发布时名称无快照可还原，显示当前名称">（当前名称）</span>`
+          : esc(a.name);
+        return `
     <tr>
-      <td>${a.fixture_id}</td><td>${esc(a.name)}</td>
+      <td>${a.fixture_id}</td><td>${nameCell}</td>
       <td>${a.line_id}</td><td>${a.start}</td><td>${a.end}</td><td>${a.channels}</td>
-      <td>${a.migrated ? "🟠 是" : "否"}</td><td>${a.locked ? "🔒" : ""}</td>
-    </tr>`
+      <td>${a.migrated ? "🟠 是" : "否"}</td><td>${lockedCell}</td>
+    </tr>`;
+      }
     )
     .join("");
 }
